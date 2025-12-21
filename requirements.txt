@@ -1,0 +1,20 @@
+# Core dependencies
+opencv-python>=4.8.0
+numpy>=1.24.0
+pillow>=10.0.0
+gradio>=4.0.0
+
+# Video processing
+ffmpeg-python>=0.2.0
+
+# OCR
+pytesseract>=0.3.10
+easyocr>=1.7.0
+
+# PDF generation
+reportlab>=4.0.0
+
+# Utilities
+jsonschema>=4.19.0
+pathlib>=1.0.1
+tqdm>=4.66.0
