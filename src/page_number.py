@@ -17,6 +17,8 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 import traceback
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import pytesseract
@@ -87,16 +89,19 @@ class PageNumberRecognizer:
 
     def __init__(self,
                  ocr_engine: str = 'pytesseract',
-                 roi: Optional[ROIRect] = None):
+                 roi: Optional[ROIRect] = None,
+                 max_workers: Optional[int] = None):
         """
         Initialize page number recognizer
 
         Args:
             ocr_engine: 'pytesseract' or 'easyocr'
             roi: Region of Interest for page number location
+            max_workers: Maximum number of worker processes for parallel OCR
         """
         self.ocr_engine = ocr_engine
         self.roi = roi if roi else self.DEFAULT_ROI
+        self.max_workers = max_workers if max_workers is not None else min(4, multiprocessing.cpu_count())
         self.logger = logging.getLogger(__name__)
 
         # Initialize OCR engine
@@ -383,13 +388,53 @@ class PageNumberRecognizer:
 
         return results
 
-    def update_slides_with_page_numbers(self, slides: List[Dict], images: List[np.ndarray]) -> List[Dict]:
+    def batch_recognize_parallel(self, images: List[np.ndarray]) -> List[Optional[int]]:
+        """
+        Recognize page numbers for multiple images using parallel processing
+
+        Args:
+            images: List of input images
+
+        Returns:
+            List of detected page numbers
+        """
+        if not images:
+            return []
+
+        self.logger.info(f"Starting parallel OCR with {self.max_workers} threads for {len(images)} images")
+
+        # Use ThreadPoolExecutor (OCR calls external tesseract process, so I/O bound)
+        # ThreadPoolExecutor avoids Windows pickle serialization issues with ProcessPoolExecutor
+        from tqdm import tqdm
+
+        def recognize_single(img):
+            """Wrapper to recognize single image with exception handling"""
+            try:
+                return self.recognize_page_number(img)
+            except Exception as e:
+                self.logger.warning(f"OCR failed: {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            results = list(tqdm(
+                executor.map(recognize_single, images),
+                total=len(images),
+                desc="Recognizing page numbers (parallel)"
+            ))
+
+        return results
+
+    def update_slides_with_page_numbers(self,
+                                        slides: List[Dict],
+                                        images: List[np.ndarray],
+                                        use_parallel: bool = True) -> List[Dict]:
         """
         Update slide metadata with recognized page numbers
 
         Args:
             slides: List of slide metadata
             images: List of slide images
+            use_parallel: Whether to use parallel processing
 
         Returns:
             Updated slide metadata
@@ -397,7 +442,11 @@ class PageNumberRecognizer:
         if len(slides) != len(images):
             self.logger.warning(f"Mismatch: {len(slides)} slides, {len(images)} images")
 
-        page_numbers = self.batch_recognize(images)
+        # Choose processing method
+        if use_parallel and len(images) > 1:
+            page_numbers = self.batch_recognize_parallel(images)
+        else:
+            page_numbers = self.batch_recognize(images)
 
         for i, (slide, page_num) in enumerate(zip(slides, page_numbers)):
             slide['page_number'] = page_num

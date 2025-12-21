@@ -23,7 +23,7 @@ from .thumbs import ThumbnailGenerator
 from .selection import SlideSelection
 from .page_number import PageNumberRecognizer, PageNumberSorter, ROIRect
 from .exporter import Exporter
-from .presets import PresetManager, Preset
+from .presets import PresetManager, Preset, TabPresetManager
 from dataclasses import asdict
 from pathlib import Path as PathLib
 
@@ -84,6 +84,25 @@ class VideoProcessingPipeline:
         self.current_preset: Optional[Preset] = None
         self.processing_log: List[str] = []
         self._non_duplicate_slides: List[Dict] = []  # Slides without duplicate page numbers
+        self._stop_processing = False  # Flag to stop processing
+
+    def check_stop(self) -> bool:
+        """
+        Check if processing should be stopped
+
+        Returns:
+            True if processing should be stopped
+        """
+        return self._stop_processing
+
+    def stop_processing(self):
+        """Signal to stop processing"""
+        self.logger.info("Stop signal received. Processing will terminate after current step.")
+        self._stop_processing = True
+
+    def continue_processing(self):
+        """Reset stop flag to continue processing"""
+        self._stop_processing = False
 
     def load_preset(self, preset_name: str) -> bool:
         """
@@ -120,6 +139,7 @@ class VideoProcessingPipeline:
         try:
             # Reset state
             self.reset_state()
+            self.continue_processing()  # Ensure processing flag is not set
 
             # Load preset
             if not self.load_preset(preset_name):
@@ -139,6 +159,10 @@ class VideoProcessingPipeline:
                 f"{self.video_metadata.fps:.2f}fps, {self.video_metadata.duration:.2f}s"
             )
 
+            # Check if stopped
+            if self.check_stop():
+                return False, "Processing cancelled by user", None
+
             # Detect slides
             self.logger.info("Detecting slides...")
             detector = SlideDetector(
@@ -151,11 +175,16 @@ class VideoProcessingPipeline:
 
             # Get frame iterator
             frame_iter = video_io.get_frame_iter(
-                target_fps=self.current_preset.detection.target_fps
+                target_fps=1.0 / self.current_preset.detection.frame_interval
             )
 
             # Process frames
             self.slide_frames = detector.process_frames(frame_iter, self.video_metadata.fps)
+
+            # Check if stopped after slide detection
+            if self.check_stop():
+                return False, "Processing cancelled by user", None
+
             self.logger.info(f"Detected {len(self.slide_frames)} slides")
 
             # Generate thumbnails
@@ -163,7 +192,8 @@ class VideoProcessingPipeline:
             thumb_gen = ThumbnailGenerator(
                 thumbs_dir=self.output_dirs['thumbs'],
                 max_size=self.current_preset.thumbnail.max_size,
-                quality=self.current_preset.thumbnail.quality
+                quality=self.current_preset.thumbnail.quality,
+                max_workers=4  # Use 4 threads for parallel I/O
             )
 
             # Convert to dictionaries for thumbnail generation
@@ -171,11 +201,15 @@ class VideoProcessingPipeline:
 
             # Get frame iterator again for thumbnail generation
             frame_iter = video_io.get_frame_iter(
-                target_fps=self.current_preset.detection.target_fps
+                target_fps=1.0 / self.current_preset.detection.frame_interval
             )
 
-            # Generate thumbnails
-            self.slides_with_thumbnails = thumb_gen.generate_batch(slide_dicts, frame_iter)
+            # Generate thumbnails (use parallel method for I/O speedup)
+            self.slides_with_thumbnails = thumb_gen.generate_batch_parallel(slide_dicts, frame_iter)
+
+            # Check if stopped after thumbnail generation
+            if self.check_stop():
+                return False, "Processing cancelled by user", None
 
             # Update selection
             self.selection.set_slides(self.slides_with_thumbnails)
@@ -224,7 +258,8 @@ class VideoProcessingPipeline:
 
             recognizer = PageNumberRecognizer(
                 ocr_engine=self.current_preset.ocr.engine,
-                roi=roi
+                roi=roi,
+                max_workers=4  # Use 4 processes for parallel OCR
             )
 
             # Load images
@@ -242,8 +277,8 @@ class VideoProcessingPipeline:
                 else:
                     images.append(None)
 
-            # Recognize page numbers
-            updated_slides = recognizer.update_slides_with_page_numbers(slides, images)
+            # Recognize page numbers (use parallel processing by default)
+            updated_slides = recognizer.update_slides_with_page_numbers(slides, images, use_parallel=True)
 
             # Sort by page number
             sorter = PageNumberSorter()
@@ -389,6 +424,7 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
 
         # State
         preset_manager = pipeline.preset_manager
+        tab_preset_manager = TabPresetManager('OUTPUT/presets')
         current_slides = gr.State(value=[])
         selected_slides_for_export = gr.State(value=[])
         selected_slides_for_ocr = gr.State(value=[])
@@ -414,13 +450,59 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                     value="OUTPUT",
                     info="默认为视频目录下的OUTPUT文件夹"
                 )
-                preset_dropdown = gr.Dropdown(
-                    label="选择预设",
-                    choices=preset_manager.list_presets(),
-                    value='default'
-                )
 
-            parse_btn = gr.Button("开始解析", variant="primary")
+            # Preset section for detection
+            with gr.Row():
+                detection_preset_dropdown = gr.Dropdown(
+                    label="检测预设",
+                    choices=tab_preset_manager.list_presets('detection'),
+                    value='default',
+                    scale=2
+                )
+                load_detection_preset_btn = gr.Button("加载预设", scale=1)
+                detection_preset_name = gr.Textbox(
+                    label="预设名称",
+                    placeholder="输入名称保存当前参数",
+                    scale=2
+                )
+                save_detection_preset_btn = gr.Button("保存为预设", scale=1)
+
+            # Collapsible parameters section
+            with gr.Accordion("高级检测参数", open=False):
+                with gr.Row():
+                    frame_diff_threshold = gr.Number(
+                        label="帧差阈值 (0-100)",
+                        value=30.0,
+                        info="越小越敏感，范围: 0-100，支持小数点"
+                    )
+                    min_stable_frames = gr.Number(
+                        label="最小稳定帧数",
+                        value=3,
+                        info="确认幻灯片变化所需的稳定帧数",
+                        minimum=1
+                    )
+                with gr.Row():
+                    min_duration_sec = gr.Number(
+                        label="最小持续时间(秒)",
+                        value=2.0,
+                        info="幻灯片最小显示时长",
+                        minimum=0.5
+                    )
+                    frame_interval = gr.Number(
+                        label="每多少秒检测一帧",
+                        value=1.0,
+                        info="长视频建议: 1-5秒 (例: 5.0 = 每5秒检测1帧)",
+                        minimum=0.5,
+                        maximum=30.0,
+                        step=0.5
+                    )
+                with gr.Row():
+                    use_ssim = gr.Checkbox(label="使用SSIM算法", value=False)
+                    use_histogram = gr.Checkbox(label="使用直方图算法", value=False)
+
+            with gr.Row():
+                parse_btn = gr.Button("开始解析", variant="primary", scale=1)
+                stop_btn = gr.Button("停止处理", variant="stop", scale=1)
 
             with gr.Row():
                 parse_status = gr.Textbox(
@@ -432,7 +514,53 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                     label="视频信息"
                 )
 
-            def parse_video_gui(vfile, vpath, outdir, preset):
+            # Load detection preset
+            def load_detection_preset_fn(preset_name):
+                preset_data = tab_preset_manager.load_preset('detection', preset_name)
+                if preset_data:
+                    return (
+                        preset_data.get('frame_diff_threshold', 30.0),
+                        preset_data.get('min_stable_frames', 3),
+                        preset_data.get('min_duration_sec', 2.0),
+                        preset_data.get('frame_interval', 1.0),
+                        preset_data.get('use_ssim', False),
+                        preset_data.get('use_histogram', False),
+                        f"已加载预设: {preset_name}"
+                    )
+                return 30.0, 3, 2.0, 1.0, False, False, f"预设 {preset_name} 不存在"
+
+            load_detection_preset_btn.click(
+                fn=load_detection_preset_fn,
+                inputs=[detection_preset_dropdown],
+                outputs=[frame_diff_threshold, min_stable_frames, min_duration_sec,
+                        frame_interval, use_ssim, use_histogram, parse_status]
+            )
+
+            # Save detection preset
+            def save_detection_preset_fn(name, threshold, stable, duration, interval, ssim, histogram):
+                if not name.strip():
+                    return "请输入预设名称", gr.update()
+                data = {
+                    'frame_diff_threshold': threshold,
+                    'min_stable_frames': stable,
+                    'min_duration_sec': duration,
+                    'frame_interval': interval,
+                    'use_ssim': ssim,
+                    'use_histogram': histogram
+                }
+                if tab_preset_manager.save_preset('detection', name, data, overwrite=True):
+                    new_choices = tab_preset_manager.list_presets('detection')
+                    return f"已保存预设: {name}", gr.update(choices=new_choices, value=name)
+                return "保存失败", gr.update()
+
+            save_detection_preset_btn.click(
+                fn=save_detection_preset_fn,
+                inputs=[detection_preset_name, frame_diff_threshold, min_stable_frames,
+                       min_duration_sec, frame_interval, use_ssim, use_histogram],
+                outputs=[parse_status, detection_preset_dropdown]
+            )
+
+            def parse_video_gui(vfile, vpath, outdir, threshold, stable, duration, interval, ssim, histogram):
                 """Parse video with proper timestamp directory generation"""
                 import os
                 from pathlib import Path as PathLib
@@ -459,10 +587,22 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
 
                 # Reset state
                 pipeline.reset_state()
+                pipeline.continue_processing()  # Ensure processing flag is not set
 
-                # Load preset
-                if not pipeline.load_preset(preset):
-                    return f"Failed to load preset: {preset}", None, []
+                # Create a temporary preset with current parameters
+                from .presets import DetectionParams, ThumbnailParams
+                pipeline.current_preset = Preset(
+                    name='custom',
+                    detection=DetectionParams(
+                        frame_diff_threshold=threshold,
+                        min_stable_frames=stable,
+                        min_duration_sec=duration,
+                        frame_interval=interval,
+                        use_ssim=ssim,
+                        use_histogram=histogram
+                    ),
+                    thumbnail=ThumbnailParams()
+                )
 
                 pipeline.video_path = PathLib(video_path)
                 pipeline.output_dirs = VideoIO.init_output_dirs(str(final_output))
@@ -478,22 +618,29 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                     f"{pipeline.video_metadata.fps:.2f}fps, {pipeline.video_metadata.duration:.2f}s"
                 )
 
+                # Check if stopped
+                if pipeline.check_stop():
+                    return "Processing cancelled by user", None, []
+
                 # Detect slides
                 detector = SlideDetector(
-                    frame_diff_threshold=pipeline.current_preset.detection.frame_diff_threshold,
-                    min_stable_frames=pipeline.current_preset.detection.min_stable_frames,
-                    min_duration_sec=pipeline.current_preset.detection.min_duration_sec,
-                    use_ssim=pipeline.current_preset.detection.use_ssim,
-                    use_histogram=pipeline.current_preset.detection.use_histogram
+                    frame_diff_threshold=threshold,
+                    min_stable_frames=stable,
+                    min_duration_sec=duration,
+                    use_ssim=ssim,
+                    use_histogram=histogram
                 )
 
                 # Get frame iterator
-                frame_iter = video_io.get_frame_iter(
-                    target_fps=pipeline.current_preset.detection.target_fps
-                )
+                frame_iter = video_io.get_frame_iter(target_fps=1.0/interval)
 
                 # Process frames
                 pipeline.slide_frames = detector.process_frames(frame_iter, pipeline.video_metadata.fps)
+
+                # Check if stopped after slide detection
+                if pipeline.check_stop():
+                    return "Processing cancelled by user", None, []
+
                 pipeline.logger.info(f"Detected {len(pipeline.slide_frames)} slides")
 
                 # Generate thumbnails and save original images
@@ -501,19 +648,22 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                     thumbs_dir=pipeline.output_dirs['thumbs'],
                     original_dir=pipeline.output_dirs['images'],
                     max_size=pipeline.current_preset.thumbnail.max_size,
-                    quality=pipeline.current_preset.thumbnail.quality
+                    quality=pipeline.current_preset.thumbnail.quality,
+                    max_workers=4  # Use 4 threads for parallel I/O
                 )
 
                 # Convert to dictionaries for thumbnail generation
                 slide_dicts = [asdict(sf) for sf in pipeline.slide_frames]
 
                 # Get frame iterator again for thumbnail generation
-                frame_iter = video_io.get_frame_iter(
-                    target_fps=pipeline.current_preset.detection.target_fps
-                )
+                frame_iter = video_io.get_frame_iter(target_fps=1.0/interval)
 
-                # Generate thumbnails
-                pipeline.slides_with_thumbnails = thumb_gen.generate_batch(slide_dicts, frame_iter)
+                # Generate thumbnails (use parallel method for I/O speedup)
+                pipeline.slides_with_thumbnails = thumb_gen.generate_batch_parallel(slide_dicts, frame_iter)
+
+                # Check if stopped after thumbnail generation
+                if pipeline.check_stop():
+                    return "Processing cancelled by user", None, []
 
                 # Update selection
                 pipeline.selection.set_slides(pipeline.slides_with_thumbnails)
@@ -535,8 +685,21 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
 
             parse_btn.click(
                 fn=parse_video_gui,
-                inputs=[video_input, video_path_input, output_dir, preset_dropdown],
+                inputs=[video_input, video_path_input, output_dir,
+                       frame_diff_threshold, min_stable_frames, min_duration_sec,
+                       frame_interval, use_ssim, use_histogram],
                 outputs=[parse_status, video_info, current_slides]
+            )
+
+            # Stop processing button
+            def stop_processing_fn():
+                """Stop the current processing"""
+                pipeline.stop_processing()
+                return "已发送停止信号，正在等待当前步骤完成..."
+
+            stop_btn.click(
+                fn=stop_processing_fn,
+                outputs=[parse_status]
             )
 
         # Tab 2: Slide Selection
@@ -734,6 +897,22 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
             ocr_results = gr.State(value={})  # {slide_index: page_number}
             missing_pages = gr.State(value=[])  # List of missing page numbers
 
+            # OCR Preset section
+            with gr.Row():
+                ocr_preset_dropdown = gr.Dropdown(
+                    label="OCR预设",
+                    choices=tab_preset_manager.list_presets('ocr'),
+                    value='default',
+                    scale=2
+                )
+                load_ocr_preset_btn = gr.Button("加载预设", scale=1)
+                ocr_preset_name = gr.Textbox(
+                    label="预设名称",
+                    placeholder="输入名称保存当前参数",
+                    scale=2
+                )
+                save_ocr_preset_btn = gr.Button("保存为预设", scale=1)
+
             # OCR Engine Settings - Full width
             with gr.Row():
                 tesseract_path = gr.Textbox(
@@ -805,6 +984,48 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                     value={},
                     scale=1
                 )
+
+            # Load OCR preset
+            def load_ocr_preset_fn(preset_name):
+                preset_data = tab_preset_manager.load_preset('ocr', preset_name)
+                if preset_data:
+                    return (
+                        preset_data.get('engine', 'pytesseract'),
+                        preset_data.get('roi_x', 70.0),
+                        preset_data.get('roi_y', 70.0),
+                        preset_data.get('roi_w', 25.0),
+                        preset_data.get('roi_h', 20.0),
+                        f"已加载预设: {preset_name}"
+                    )
+                return 'pytesseract', 70.0, 70.0, 25.0, 20.0, f"预设 {preset_name} 不存在"
+
+            load_ocr_preset_btn.click(
+                fn=load_ocr_preset_fn,
+                inputs=[ocr_preset_dropdown],
+                outputs=[ocr_engine, roi_x, roi_y, roi_w, roi_h, ocr_status]
+            )
+
+            # Save OCR preset
+            def save_ocr_preset_fn(name, engine, x, y, w, h):
+                if not name.strip():
+                    return "请输入预设名称", gr.update()
+                data = {
+                    'engine': engine,
+                    'roi_x': x,
+                    'roi_y': y,
+                    'roi_w': w,
+                    'roi_h': h
+                }
+                if tab_preset_manager.save_preset('ocr', name, data, overwrite=True):
+                    new_choices = tab_preset_manager.list_presets('ocr')
+                    return f"已保存预设: {name}", gr.update(choices=new_choices, value=name)
+                return "保存失败", gr.update()
+
+            save_ocr_preset_btn.click(
+                fn=save_ocr_preset_fn,
+                inputs=[ocr_preset_name, ocr_engine, roi_x, roi_y, roi_w, roi_h],
+                outputs=[ocr_status, ocr_preset_dropdown]
+            )
 
             # Preview image change handler
             def update_preview(image_path, roi_x, roi_y, roi_w, roi_h):
@@ -922,7 +1143,8 @@ ROI区域 (像素):
 
                 recognizer = PageNumberRecognizer(
                     ocr_engine=ocr_engine,
-                    roi=roi
+                    roi=roi,
+                    max_workers=4  # Use 4 processes for parallel OCR
                 )
 
                 # Load images -优先使用原图以提高OCR准确度
@@ -942,8 +1164,8 @@ ROI区域 (像素):
                         pipeline.logger.warning(f"Image path not found: {img_path}")
                         images.append(None)
 
-                # Recognize page numbers
-                updated_slides = recognizer.update_slides_with_page_numbers(slides, images)
+                # Recognize page numbers (use parallel processing by default)
+                updated_slides = recognizer.update_slides_with_page_numbers(slides, images, use_parallel=True)
 
                 # Save pages to files
                 pages_dir = None
@@ -1072,6 +1294,22 @@ ROI区域 (像素):
                 interactive=False
             )
 
+            # Export Preset section
+            with gr.Row():
+                export_preset_dropdown = gr.Dropdown(
+                    label="导出预设",
+                    choices=tab_preset_manager.list_presets('export'),
+                    value='default',
+                    scale=2
+                )
+                load_export_preset_btn = gr.Button("加载预设", scale=1)
+                export_preset_name = gr.Textbox(
+                    label="预设名称",
+                    placeholder="输入名称保存当前参数",
+                    scale=2
+                )
+                save_export_preset_btn = gr.Button("保存为预设", scale=1)
+
             with gr.Row():
                 export_format = gr.Radio(
                     label="导出格式",
@@ -1091,6 +1329,42 @@ ROI区域 (像素):
                     lines=5,
                     interactive=False
                 )
+
+            # Load export preset
+            def load_export_preset_fn(preset_name):
+                preset_data = tab_preset_manager.load_preset('export', preset_name)
+                if preset_data:
+                    return (
+                        preset_data.get('format', 'pdf'),
+                        preset_data.get('naming', 'index'),
+                        f"已加载预设: {preset_name}"
+                    )
+                return 'pdf', 'index', f"预设 {preset_name} 不存在"
+
+            load_export_preset_btn.click(
+                fn=load_export_preset_fn,
+                inputs=[export_preset_dropdown],
+                outputs=[export_format, naming_strategy, export_status]
+            )
+
+            # Save export preset
+            def save_export_preset_fn(name, fmt, naming):
+                if not name.strip():
+                    return "请输入预设名称", gr.update()
+                data = {
+                    'format': fmt,
+                    'naming': naming
+                }
+                if tab_preset_manager.save_preset('export', name, data, overwrite=True):
+                    new_choices = tab_preset_manager.list_presets('export')
+                    return f"已保存预设: {name}", gr.update(choices=new_choices, value=name)
+                return "保存失败", gr.update()
+
+            save_export_preset_btn.click(
+                fn=save_export_preset_fn,
+                inputs=[export_preset_name, export_format, naming_strategy],
+                outputs=[export_status, export_preset_dropdown]
+            )
 
             # Update selection source display
             def update_selection_source(selected_slides, source):

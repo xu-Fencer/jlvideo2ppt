@@ -155,7 +155,7 @@ class VideoIO:
                       end_time: Optional[float] = None,
                       target_fps: float = 1.0) -> Iterator[Tuple[int, np.ndarray, float]]:
         """
-        Get iterator over video frames
+        Get iterator over video frames (memory-efficient)
 
         Args:
             start_time: Start time in seconds
@@ -165,6 +165,8 @@ class VideoIO:
         Yields:
             Tuple of (frame_number, frame_array, timestamp)
         """
+        import gc
+
         cap = cv2.VideoCapture(str(self._video_path))
         if not cap.isOpened():
             raise RuntimeError(f"Failed to open video: {self._video_path}")
@@ -189,6 +191,7 @@ class VideoIO:
 
             frame_number = start_frame
             frame_count = 0
+            gc_counter = 0
 
             with tqdm(total=(end_frame - start_frame) // frame_interval,
                      desc="Processing frames", unit="frame") as pbar:
@@ -202,12 +205,22 @@ class VideoIO:
                         timestamp = frame_number / original_fps
                         yield frame_number, frame, timestamp
                         pbar.update(1)
+                        gc_counter += 1
+
+                        # Periodic garbage collection every 100 frames
+                        if gc_counter >= 100:
+                            gc.collect()
+                            gc_counter = 0
+                    else:
+                        # Release frames that are not yielded
+                        del frame
 
                     frame_number += 1
                     frame_count += 1
 
         finally:
             cap.release()
+            gc.collect()
 
     @staticmethod
     def handle_upload(uploaded_file: Union[str, Tuple, None],

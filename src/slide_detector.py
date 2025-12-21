@@ -61,13 +61,16 @@ class SlideDetector:
 
         self.logger = logging.getLogger(__name__)
         self._previous_frame: Optional[np.ndarray] = None
-        self._consecutive_changes = 0
-        self._last_slide_frame: Optional[int] = None
+        self._last_slide_timestamp: Optional[float] = None
         self._slide_frames: List[SlideFrame] = []
+
+        # Pre-allocated buffers for frame preprocessing (to avoid reallocation)
+        self._gray_buffer: Optional[np.ndarray] = None
+        self._blur_buffer: Optional[np.ndarray] = None
 
     def preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
         """
-        Preprocess frame for comparison
+        Preprocess frame for comparison (optimized with buffer reuse)
 
         Args:
             frame: Input frame (BGR format)
@@ -75,13 +78,20 @@ class SlideDetector:
         Returns:
             Preprocessed grayscale frame
         """
-        # Convert to grayscale
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = frame.shape[:2]
 
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (21, 21), 0)
+        # Ensure buffers are allocated and match frame size
+        if self._gray_buffer is None or self._gray_buffer.shape != (h, w):
+            self._gray_buffer = np.empty((h, w), dtype=np.uint8)
+            self._blur_buffer = np.empty((h, w), dtype=np.uint8)
 
-        return blurred
+        # Convert to grayscale (in-place)
+        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY, dst=self._gray_buffer)
+
+        # Apply Gaussian blur to reduce noise (in-place)
+        cv2.GaussianBlur(self._gray_buffer, (21, 21), 0, dst=self._blur_buffer)
+
+        return self._blur_buffer
 
     def compute_frame_difference(self,
                                 current_frame: np.ndarray,
@@ -179,54 +189,59 @@ class SlideDetector:
         Returns:
             True if slide change detected
         """
-        # Compute primary metric (frame difference)
-        diff_score, change_ratio = self.compute_frame_difference(current_frame, previous_frame)
+        # Compute frame difference
+        diff = cv2.absdiff(current_frame, previous_frame)
+        diff_score = np.mean(diff)
 
-        # Check minimum change threshold
-        primary_detection = change_ratio > 0.1  # At least 10% of pixels changed
+        # frame_diff_threshold is 0-100, representing sensitivity percentage
+        # Lower threshold = more sensitive (detects smaller changes)
+        # At threshold=5, we want to detect diff_score >= ~1.0
+        # At threshold=50, we want to detect diff_score >= ~10.0
+        # Scale: threshold / 5 gives reasonable detection range
+        threshold_scaled = self.frame_diff_threshold / 5.0
+
+        # Primary detection: average difference exceeds threshold
+        primary_detection = diff_score > threshold_scaled
+
+        # Also compute change ratio for logging
+        _, thresh_binary = cv2.threshold(diff, max(1, threshold_scaled), 255, cv2.THRESH_BINARY)
+        change_ratio = np.sum(thresh_binary == 255) / thresh_binary.size
 
         # Backup methods
         backup_detection = False
         backup_details = ""
 
-        if primary_detection and (self.use_ssim or self.use_histogram):
-            if self.use_ssim:
-                ssim = self.compute_ssim(current_frame, previous_frame)
-                backup_detection = backup_detection or (ssim < 0.8)
-                backup_details += f"SSIM: {ssim:.3f} "
+        if self.use_ssim:
+            ssim = self.compute_ssim(current_frame, previous_frame)
+            backup_detection = backup_detection or (ssim < 0.8)
+            backup_details += f"SSIM: {ssim:.3f} "
 
-            if self.use_histogram:
-                correlation, chi_square = self.compute_histogram(current_frame, previous_frame)
-                backup_detection = backup_detection or (correlation < 0.9)
-                backup_details += f"Hist: {correlation:.3f}"
+        if self.use_histogram:
+            correlation, chi_square = self.compute_histogram(current_frame, previous_frame)
+            backup_detection = backup_detection or (correlation < 0.9)
+            backup_details += f"Hist: {correlation:.3f}"
 
         # Check if enough time has passed since last slide
-        if self._last_slide_frame is not None:
-            time_since_last = timestamp - (self._last_slide_frame / 30.0)  # Assuming 30fps
+        if self._last_slide_timestamp is not None:
+            time_since_last = timestamp - self._last_slide_timestamp
             if time_since_last < self.min_duration_sec:
-                if primary_detection:
-                    self.logger.debug(
-                        f"Slide change rejected (too soon): {time_since_last:.2f}s < {self.min_duration_sec}s"
-                    )
+                self.logger.debug(
+                    f"Slide change rejected (too soon): {time_since_last:.2f}s < {self.min_duration_sec}s"
+                )
                 return False
 
-        # Debouncing: require consecutive detections
-        if primary_detection or backup_detection:
-            self._consecutive_changes += 1
-            is_confirmed = self._consecutive_changes >= self.min_stable_frames
-        else:
-            self._consecutive_changes = max(0, self._consecutive_changes - 1)
-            is_confirmed = False
+        # Detection logic: either primary or backup method triggers
+        is_detected = primary_detection or backup_detection
 
-        if is_confirmed:
+        if is_detected:
             self.logger.info(
                 f"Slide change detected at {timestamp:.2f}s "
-                f"(diff: {diff_score:.2f}, ratio: {change_ratio:.3f}) "
+                f"(diff_score: {diff_score:.2f}, threshold: {threshold_scaled:.2f}, ratio: {change_ratio:.3f}) "
                 f"{backup_details}"
             )
-            self._last_slide_frame = timestamp * 30.0  # Store approximate frame number
+            self._last_slide_timestamp = timestamp
 
-        return is_confirmed
+        return is_detected
 
     def process_frames(self,
                       frame_iterator,
@@ -243,15 +258,14 @@ class SlideDetector:
         """
         self._slide_frames = []
         self._previous_frame = None
-        self._consecutive_changes = 0
-        self._last_slide_frame = None
-        first_frame_data = None  # Store first frame info
+        self._last_slide_timestamp = None
+        first_frame_info = None  # Only store frame_number and timestamp, not the frame data
 
         for frame_number, frame, timestamp in frame_iterator:
             try:
-                # Store first frame info
-                if first_frame_data is None:
-                    first_frame_data = (frame_number, frame, timestamp)
+                # Store first frame info (NOT the frame itself to save memory)
+                if first_frame_info is None:
+                    first_frame_info = (frame_number, timestamp)
 
                 # Preprocess current frame
                 current_processed = self.preprocess_frame(frame)
@@ -268,16 +282,26 @@ class SlideDetector:
                         )
                         self._slide_frames.append(slide_frame)
 
-                # Update previous frame
-                self._previous_frame = current_processed
+                # Update previous frame (make a copy since current_processed points to reused buffer)
+                if self._previous_frame is not None:
+                    del self._previous_frame
+                self._previous_frame = current_processed.copy()
+
+                # Explicitly release the original frame to free memory
+                del frame
 
             except Exception as e:
                 self.logger.error(f"Error processing frame {frame_number}: {e}")
                 continue
 
+        # Clean up previous frame
+        if self._previous_frame is not None:
+            del self._previous_frame
+            self._previous_frame = None
+
         # Always add first frame as the initial slide
-        if first_frame_data is not None:
-            frame_number, frame, timestamp = first_frame_data
+        if first_frame_info is not None:
+            frame_number, timestamp = first_frame_info
             first_slide = SlideFrame(
                 frame_number=frame_number,
                 timestamp=timestamp,

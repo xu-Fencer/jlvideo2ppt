@@ -22,10 +22,10 @@ from jsonschema import validate, ValidationError
 class DetectionParams:
     """Slide detection parameters"""
 
-    frame_diff_threshold: float = 30.0
+    frame_diff_threshold: float = 30.0  # 范围: 0-100，支持小数
     min_stable_frames: int = 3
     min_duration_sec: float = 2.0
-    target_fps: float = 1.0
+    frame_interval: float = 1.0  # 每多少秒检测一帧 (1.0 = 每秒1帧, 5.0 = 每5秒1帧)
     use_ssim: bool = False
     use_histogram: bool = False
     ssim_threshold: float = 0.8
@@ -102,6 +102,160 @@ class Preset:
             self.ocr = OCRParams()
         if self.export is None:
             self.export = ExportParams()
+
+
+class TabPresetManager:
+    """Manage per-tab presets separately"""
+
+    def __init__(self, presets_dir: str):
+        self.presets_dir = Path(presets_dir)
+        self.presets_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger(__name__)
+
+        # Tab-specific directories
+        self.tab_dirs = {
+            'detection': self.presets_dir / 'detection',
+            'ocr': self.presets_dir / 'ocr',
+            'export': self.presets_dir / 'export'
+        }
+        for d in self.tab_dirs.values():
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Default presets for each tab
+        self._default_presets = {
+            'detection': {
+                'default': {
+                    'name': '默认',
+                    'frame_diff_threshold': 30.0,
+                    'min_stable_frames': 3,
+                    'min_duration_sec': 2.0,
+                    'target_fps': 1.0,
+                    'use_ssim': False,
+                    'use_histogram': False
+                },
+                'high_quality': {
+                    'name': '高质量',
+                    'frame_diff_threshold': 25.0,
+                    'min_stable_frames': 5,
+                    'min_duration_sec': 3.0,
+                    'target_fps': 1.0,
+                    'use_ssim': False,
+                    'use_histogram': False
+                },
+                'fast': {
+                    'name': '快速',
+                    'frame_diff_threshold': 40.0,
+                    'min_stable_frames': 2,
+                    'min_duration_sec': 1.0,
+                    'target_fps': 2.0,
+                    'use_ssim': False,
+                    'use_histogram': False
+                }
+            },
+            'ocr': {
+                'default': {
+                    'name': '默认',
+                    'engine': 'pytesseract',
+                    'roi_x': 70.0,
+                    'roi_y': 70.0,
+                    'roi_w': 25.0,
+                    'roi_h': 20.0,
+                    'confidence_threshold': 30.0
+                },
+                'bottom_right': {
+                    'name': '右下角页码',
+                    'engine': 'pytesseract',
+                    'roi_x': 85.0,
+                    'roi_y': 90.0,
+                    'roi_w': 12.0,
+                    'roi_h': 8.0,
+                    'confidence_threshold': 30.0
+                },
+                'bottom_center': {
+                    'name': '底部居中页码',
+                    'engine': 'pytesseract',
+                    'roi_x': 40.0,
+                    'roi_y': 90.0,
+                    'roi_w': 20.0,
+                    'roi_h': 8.0,
+                    'confidence_threshold': 30.0
+                }
+            },
+            'export': {
+                'default': {
+                    'name': '默认',
+                    'format': 'pdf',
+                    'image_format': 'jpeg',
+                    'image_quality': 95,
+                    'naming': 'index'
+                },
+                'high_quality_images': {
+                    'name': '高质量图片',
+                    'format': 'jpeg',
+                    'image_format': 'jpeg',
+                    'image_quality': 100,
+                    'naming': 'page'
+                }
+            }
+        }
+
+    def list_presets(self, tab: str) -> List[str]:
+        """List presets for a specific tab"""
+        presets = set(self._default_presets.get(tab, {}).keys())
+        tab_dir = self.tab_dirs.get(tab)
+        if tab_dir and tab_dir.exists():
+            for f in tab_dir.glob("*.json"):
+                presets.add(f.stem)
+        return sorted(list(presets))
+
+    def load_preset(self, tab: str, name: str) -> Optional[Dict]:
+        """Load a preset for a specific tab"""
+        # Try file first
+        tab_dir = self.tab_dirs.get(tab)
+        if tab_dir:
+            preset_path = tab_dir / f"{self._sanitize_filename(name)}.json"
+            if preset_path.exists():
+                with open(preset_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+
+        # Fall back to defaults
+        return self._default_presets.get(tab, {}).get(name)
+
+    def save_preset(self, tab: str, name: str, data: Dict, overwrite: bool = False) -> bool:
+        """Save a preset for a specific tab"""
+        tab_dir = self.tab_dirs.get(tab)
+        if not tab_dir:
+            return False
+
+        preset_path = tab_dir / f"{self._sanitize_filename(name)}.json"
+        if preset_path.exists() and not overwrite:
+            self.logger.warning(f"Preset '{name}' already exists in {tab}")
+            return False
+
+        data['name'] = name
+        with open(preset_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+
+    def delete_preset(self, tab: str, name: str) -> bool:
+        """Delete a custom preset"""
+        if name in self._default_presets.get(tab, {}):
+            return False  # Can't delete defaults
+
+        tab_dir = self.tab_dirs.get(tab)
+        if tab_dir:
+            preset_path = tab_dir / f"{self._sanitize_filename(name)}.json"
+            if preset_path.exists():
+                preset_path.unlink()
+                return True
+        return False
+
+    @staticmethod
+    def _sanitize_filename(name: str) -> str:
+        """Sanitize filename"""
+        safe_name = ''.join(c for c in name if c.isalnum() or c in (' ', '-', '_', '中', '文')).strip()
+        safe_name = safe_name.replace(' ', '_')
+        return safe_name if safe_name else 'unnamed'
 
 
 class PresetManager:
@@ -214,11 +368,25 @@ class PresetManager:
                     frame_diff_threshold=40.0,
                     min_stable_frames=2,
                     min_duration_sec=1.0,
-                    target_fps=2.0
+                    frame_interval=0.5  # 每0.5秒检测1帧 (相当于2 FPS)
                 ),
                 thumbnail=ThumbnailParams(
                     max_size=600,
                     quality=70
+                )
+            ),
+            'long_video': Preset(
+                name='Long Video',
+                description='Optimized for long videos (>30 minutes)',
+                detection=DetectionParams(
+                    frame_diff_threshold=35.0,
+                    min_stable_frames=3,
+                    min_duration_sec=3.0,
+                    frame_interval=5.0  # 每5秒检测1帧，适合长视频
+                ),
+                thumbnail=ThumbnailParams(
+                    max_size=800,
+                    quality=85
                 )
             )
         }
