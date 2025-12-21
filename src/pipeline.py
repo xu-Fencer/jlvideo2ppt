@@ -925,17 +925,21 @@ ROI区域 (像素):
                     roi=roi
                 )
 
-                # Load images
+                # Load images -优先使用原图以提高OCR准确度
                 images = []
                 for slide in slides:
-                    thumb_path = slide.get('thumbnail_path')
-                    if thumb_path and PathLib(thumb_path).exists():
-                        img = cv2.imread(thumb_path)
+                    # 优先使用original_image_path（原图），没有才用thumbnail_path（缩略图）
+                    img_path = slide.get('original_image_path') or slide.get('thumbnail_path')
+
+                    if img_path and PathLib(img_path).exists():
+                        img = cv2.imread(img_path)
                         if img is not None:
                             images.append(img)
                         else:
+                            pipeline.logger.warning(f"Failed to load image: {img_path}")
                             images.append(None)
                     else:
+                        pipeline.logger.warning(f"Image path not found: {img_path}")
                         images.append(None)
 
                 # Recognize page numbers

@@ -16,6 +16,7 @@ from typing import List, Dict, Optional, Tuple, Union
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+import traceback
 
 try:
     import pytesseract
@@ -126,6 +127,7 @@ class PageNumberRecognizer:
     def _init_easyocr(self):
         """Initialize EasyOCR"""
         try:
+            # Initialize EasyOCR - use basic parameters, optimization happens in readtext
             self.easyocr_reader = easyocr.Reader(['en'], gpu=False)
             self.logger.info("EasyOCR initialized successfully")
         except Exception as e:
@@ -245,21 +247,49 @@ class PageNumberRecognizer:
             else:
                 roi_rgb = cv2.cvtColor(roi_image, cv2.COLOR_GRAY2RGB)
 
-            # Run OCR
-            detections = self.easyocr_reader.readtext(roi_rgb)
+            # Run OCR with optimized parameters
+            detections = self.easyocr_reader.readtext(
+                roi_rgb,
+                # Higher confidence threshold for page numbers
+                text_threshold=0.7,
+                low_text=0.4,
+                link_threshold=0.4,
+                # Only allow numbers and common page number characters
+                allowlist='0123456789./- Page',
+                # Use paragraph mode for better grouping
+                paragraph=False,  # Changed to False to get individual results
+                # Detailed output (bbox, text, confidence)
+                detail=1
+            )
 
             for detection in detections:
-                bbox, text, conf = detection
+                # EasyOCR returns: [bbox, text, confidence] or just [text] if detail=0
+                if len(detection) == 3:
+                    bbox, text, conf = detection
 
-                if conf > 0.3:  # Confidence threshold
+                    # Higher confidence threshold for page numbers (70%)
+                    if conf > 0.7:
+                        results.append(OCRResult(
+                            text=text.strip(),
+                            confidence=conf * 100,
+                            bbox=tuple(map(int, bbox[0] + bbox[2]))  # Convert to (x, y, w, h)
+                        ))
+                    else:
+                        self.logger.debug(f"Low confidence detection rejected: '{text}' (conf: {conf:.2f})")
+                elif len(detection) == 2:
+                    # Sometimes EasyOCR returns [bbox, text] without confidence
+                    bbox, text = detection
                     results.append(OCRResult(
                         text=text.strip(),
-                        confidence=conf * 100,
-                        bbox=tuple(map(int, bbox[0] + bbox[2]))  # Convert to (x, y, w, h)
+                        confidence=50.0,  # Default confidence
+                        bbox=tuple(map(int, bbox[0] + bbox[2]))
                     ))
+
+            self.logger.debug(f"EasyOCR found {len(results)} high-confidence results")
 
         except Exception as e:
             self.logger.error(f"EasyOCR failed: {e}")
+            self.logger.error(traceback.format_exc())
 
         return results
 
