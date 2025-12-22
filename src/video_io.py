@@ -155,7 +155,7 @@ class VideoIO:
                       end_time: Optional[float] = None,
                       target_fps: float = 1.0) -> Iterator[Tuple[int, np.ndarray, float]]:
         """
-        Get iterator over video frames (memory-efficient)
+        Get iterator over video frames (memory-efficient, optimized with frame seeking)
 
         Args:
             start_time: Start time in seconds
@@ -179,44 +179,38 @@ class VideoIO:
             if original_fps <= 0:
                 raise RuntimeError("Invalid video FPS")
 
-            # Calculate frame interval
+            # Calculate frame interval and total frames to process
             frame_interval = max(1, int(original_fps / target_fps))
+            total_sample_frames = (total_frames - int(start_time * original_fps)) // frame_interval + 1
 
             # Calculate start and end frames
             start_frame = int(start_time * original_fps)
             end_frame = total_frames if end_time is None else int(end_time * original_fps)
 
-            # Set start position
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
             frame_number = start_frame
-            frame_count = 0
             gc_counter = 0
 
-            with tqdm(total=(end_frame - start_frame) // frame_interval,
-                     desc="Processing frames", unit="frame") as pbar:
+            with tqdm(total=total_sample_frames, desc="Processing frames", unit="frame") as pbar:
                 while frame_number < end_frame:
+                    # Seek directly to target frame (optimized for sparse sampling)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
                     ret, frame = cap.read()
+
                     if not ret or frame is None:
                         break
 
-                    # Sample frames based on interval
-                    if frame_count % frame_interval == 0:
-                        timestamp = frame_number / original_fps
-                        yield frame_number, frame, timestamp
-                        pbar.update(1)
-                        gc_counter += 1
+                    timestamp = frame_number / original_fps
+                    yield frame_number, frame, timestamp
+                    pbar.update(1)
+                    gc_counter += 1
 
-                        # Periodic garbage collection every 100 frames
-                        if gc_counter >= 100:
-                            gc.collect()
-                            gc_counter = 0
-                    else:
-                        # Release frames that are not yielded
-                        del frame
+                    # Periodic garbage collection every 100 frames
+                    if gc_counter >= 100:
+                        gc.collect()
+                        gc_counter = 0
 
-                    frame_number += 1
-                    frame_count += 1
+                    # Move to next sample frame
+                    frame_number += frame_interval
 
         finally:
             cap.release()
