@@ -39,6 +39,9 @@ Examples:
   # Use high quality preset
   python main.py presentation.mp4 --preset high_quality
 
+  # Process with time range (detect from 1:30 to 5:00)
+  python main.py presentation.mp4 --start-time 1:30 --end-time 5:00
+
   # Process and export only
   python main.py presentation.mp4 --export-only
         """
@@ -65,6 +68,14 @@ Examples:
         action="store_true",
         help="Skip parsing, only export previously processed slides"
     )
+    parser.add_argument(
+        "--start-time",
+        help="Start time for detection (format: HH:MM:SS or MM:SS or SS)"
+    )
+    parser.add_argument(
+        "--end-time",
+        help="End time for detection (format: HH:MM:SS or MM:SS or SS)"
+    )
 
     args = parser.parse_args()
 
@@ -86,13 +97,29 @@ Examples:
         parser.print_help()
         sys.exit(1)
 
-    if not Path(args.video_path).exists():
+    # Check if input is a URL (skip file existence check for URLs)
+    is_url = args.video_path.startswith(('http://', 'https://'))
+    if not is_url and not Path(args.video_path).exists():
         print(f"Error: Video file not found: {args.video_path}")
         sys.exit(1)
 
     # Generate output directory name based on video filename and timestamp
-    video_path = Path(args.video_path)
-    video_name = video_path.stem  # filename without extension
+    if is_url:
+        # For URLs, extract filename from URL
+        # Remove query parameters and fragments, then extract filename without extension
+        url_filename = args.video_path.split('/')[-1].split('?')[0].split('#')[0]
+        # Remove video extensions to get clean name
+        video_name = url_filename
+        for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v']:
+            if video_name.lower().endswith(ext.lower()):
+                video_name = video_name[:-len(ext)]
+                break
+        video_name = video_name or 'video'
+    else:
+        # For local files, use existing logic
+        video_path = Path(args.video_path)
+        video_name = video_path.stem  # filename without extension
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # If user specified a custom output directory, append the timestamped folder to it
@@ -116,10 +143,35 @@ Examples:
 
     # Parse video
     if not args.export_only:
+        # Parse time range arguments
+        from src.video_io import parse_time_string
+        start_time = parse_time_string(args.start_time) if args.start_time else None
+        end_time = parse_time_string(args.end_time) if args.end_time else None
+
+        # Validate time range
+        if start_time is not None and start_time < 0:
+            print(f"Error: Start time cannot be negative")
+            sys.exit(1)
+        if end_time is not None and end_time < 0:
+            print(f"Error: End time cannot be negative")
+            sys.exit(1)
+        if start_time is not None and end_time is not None and start_time >= end_time:
+            print(f"Error: Start time must be less than end time")
+            sys.exit(1)
+
+        # Display time range info
+        if start_time is not None or end_time is not None:
+            from src.video_io import format_seconds_to_time
+            start_str = format_seconds_to_time(start_time) if start_time is not None else "00:00"
+            end_str = format_seconds_to_time(end_time) if end_time is not None else "end"
+            print(f"Detection time range: {start_str} to {end_str}")
+
         success, message, result = pipeline.parse_video(
             args.video_path,
             str(final_output),
-            args.preset
+            args.preset,
+            start_time,
+            end_time
         )
 
         if not success:

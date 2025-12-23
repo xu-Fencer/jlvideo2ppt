@@ -19,6 +19,61 @@ import numpy as np
 from tqdm import tqdm
 
 
+def parse_time_string(time_str: str) -> Optional[float]:
+    """
+    Parse time string in format "HH:MM:SS" or "MM:SS" or "SS" to seconds
+
+    Args:
+        time_str: Time string (e.g., "1:30:45", "30:45", "45")
+
+    Returns:
+        Time in seconds, or None if invalid
+    """
+    if not time_str or not time_str.strip():
+        return None
+
+    try:
+        parts = time_str.strip().split(':')
+        if len(parts) == 1:
+            # Seconds only
+            return float(parts[0])
+        elif len(parts) == 2:
+            # MM:SS
+            minutes, seconds = parts
+            return float(minutes) * 60 + float(seconds)
+        elif len(parts) == 3:
+            # HH:MM:SS
+            hours, minutes, seconds = parts
+            return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+        else:
+            return None
+    except (ValueError, IndexError):
+        return None
+
+
+def format_seconds_to_time(seconds: float) -> str:
+    """
+    Format seconds to "HH:MM:SS" string
+
+    Args:
+        seconds: Time in seconds
+
+    Returns:
+        Formatted time string
+    """
+    if seconds < 0:
+        seconds = 0
+
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    else:
+        return f"{minutes:02d}:{secs:02d}"
+
+
 class VideoMetadata:
     """Container for video metadata"""
 
@@ -57,9 +112,10 @@ class VideoIO:
         Initialize VideoIO with video path
 
         Args:
-            video_path: Path to video file
+            video_path: Path to video file or URL
         """
-        self.video_path = Path(video_path)
+        self._video_path_str = str(video_path)
+        self.video_path = video_path
         self._metadata: Optional[VideoMetadata] = None
         self._cap = None
 
@@ -68,17 +124,36 @@ class VideoIO:
         """Get video path"""
         return self._video_path
 
+    @property
+    def is_url(self) -> bool:
+        """Check if the input is a URL"""
+        return self._video_path_str.startswith(('http://', 'https://'))
+
+    @property
+    def video_path_str(self) -> str:
+        """Get video path as string (works for both file paths and URLs)"""
+        return self._video_path_str
+
     @video_path.setter
     def video_path(self, path: Union[str, Path]):
         """Set video path and validate"""
-        self._video_path = Path(path)
-        if not self._video_path.exists():
-            raise FileNotFoundError(f"Video file not found: {self._video_path}")
+        self._video_path_str = str(path)
 
-        ext = self._video_path.suffix.lower()
-        if ext not in self.SUPPORTED_FORMATS:
-            raise ValueError(f"Unsupported video format: {ext}. "
-                           f"Supported formats: {', '.join(self.SUPPORTED_FORMATS)}")
+        # Check if input is a URL
+        if str(path).startswith(('http://', 'https://')):
+            # For URLs, skip file existence and format checks
+            # Convert to Path for API compatibility, but don't use for file operations
+            self._video_path = Path(str(path))
+        else:
+            # For local files, perform existing validation
+            self._video_path = Path(path)
+            if not self._video_path.exists():
+                raise FileNotFoundError(f"Video file not found: {self._video_path}")
+
+            ext = self._video_path.suffix.lower()
+            if ext not in self.SUPPORTED_FORMATS:
+                raise ValueError(f"Unsupported video format: {ext}. "
+                               f"Supported formats: {', '.join(self.SUPPORTED_FORMATS)}")
 
     def extract_metadata(self) -> VideoMetadata:
         """
@@ -92,8 +167,9 @@ class VideoIO:
 
         metadata = VideoMetadata()
 
-        # Get file size
-        metadata.size_bytes = self._video_path.stat().st_size
+        # Get file size (only for local files, not URLs)
+        if not self.is_url:
+            metadata.size_bytes = self._video_path.stat().st_size
 
         # Try ffprobe first (more accurate)
         try:
@@ -103,7 +179,7 @@ class VideoIO:
                 '-print_format', 'json',
                 '-show_format',
                 '-show_streams',
-                str(self._video_path)
+                self.video_path_str
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             data = json.loads(result.stdout)
@@ -138,7 +214,7 @@ class VideoIO:
 
         # Fallback to OpenCV if ffprobe failed
         if metadata.fps == 0 or metadata.width == 0:
-            cap = cv2.VideoCapture(str(self._video_path))
+            cap = cv2.VideoCapture(self.video_path_str)
             if cap.isOpened():
                 metadata.width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 metadata.height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -158,7 +234,7 @@ class VideoIO:
         Get iterator over video frames (memory-efficient, optimized with frame seeking)
 
         Args:
-            start_time: Start time in seconds
+            start_time: Start time in seconds (default: 0.0)
             end_time: End time in seconds (None = end of video)
             target_fps: Target FPS for sampling
 
@@ -167,25 +243,34 @@ class VideoIO:
         """
         import gc
 
-        cap = cv2.VideoCapture(str(self._video_path))
+        cap = cv2.VideoCapture(self.video_path_str)
         if not cap.isOpened():
-            raise RuntimeError(f"Failed to open video: {self._video_path}")
+            raise RuntimeError(f"Failed to open video: {self.video_path_str}")
 
         try:
             # Get video properties
             original_fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / original_fps if original_fps > 0 else 0
 
             if original_fps <= 0:
                 raise RuntimeError("Invalid video FPS")
 
+            # Validate and clamp time range
+            start_time = max(0.0, start_time)
+            if end_time is not None:
+                end_time = min(end_time, video_duration)
+            else:
+                end_time = video_duration
+
+            if start_time >= end_time:
+                raise ValueError(f"Invalid time range: start_time ({start_time:.2f}s) >= end_time ({end_time:.2f}s)")
+
             # Calculate frame interval and total frames to process
             frame_interval = max(1, int(original_fps / target_fps))
-            total_sample_frames = (total_frames - int(start_time * original_fps)) // frame_interval + 1
-
-            # Calculate start and end frames
             start_frame = int(start_time * original_fps)
-            end_frame = total_frames if end_time is None else int(end_time * original_fps)
+            end_frame = int(end_time * original_fps)
+            total_sample_frames = (end_frame - start_frame) // frame_interval + 1
 
             frame_number = start_frame
             gc_counter = 0

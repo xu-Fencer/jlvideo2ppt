@@ -124,14 +124,18 @@ class VideoProcessingPipeline:
     def parse_video(self,
                    video_path: str,
                    output_dir: str,
-                   preset_name: str = 'default') -> Tuple[bool, str, Optional[Dict]]:
+                   preset_name: str = 'default',
+                   start_time: Optional[float] = None,
+                   end_time: Optional[float] = None) -> Tuple[bool, str, Optional[Dict]]:
         """
         Parse video and detect slides
 
         Args:
-            video_path: Path to video file
+            video_path: Path to video file or URL
             output_dir: Output directory
             preset_name: Preset to use
+            start_time: Start time in seconds (optional)
+            end_time: End time in seconds (optional)
 
         Returns:
             Tuple of (success, message, result_dict)
@@ -175,6 +179,8 @@ class VideoProcessingPipeline:
 
             # Get frame iterator
             frame_iter = video_io.get_frame_iter(
+                start_time=start_time if start_time is not None else 0.0,
+                end_time=end_time,
                 target_fps=1.0 / self.current_preset.detection.frame_interval
             )
 
@@ -191,6 +197,7 @@ class VideoProcessingPipeline:
             self.logger.info("Generating thumbnails...")
             thumb_gen = ThumbnailGenerator(
                 thumbs_dir=self.output_dirs['thumbs'],
+                original_dir=self.output_dirs['images'],
                 max_size=self.current_preset.thumbnail.max_size,
                 quality=self.current_preset.thumbnail.quality,
                 max_workers=4  # Use 4 threads for parallel I/O
@@ -199,13 +206,14 @@ class VideoProcessingPipeline:
             # Convert to dictionaries for thumbnail generation
             slide_dicts = [asdict(sf) for sf in self.slide_frames]
 
-            # Get frame iterator again for thumbnail generation
-            frame_iter = video_io.get_frame_iter(
-                target_fps=1.0 / self.current_preset.detection.frame_interval
-            )
+            # Extract frame positions for thumbnails (optimized with direct seeking)
+            frame_positions = [sf.frame_number for sf in self.slide_frames]
 
-            # Generate thumbnails (use parallel method for I/O speedup)
-            self.slides_with_thumbnails = thumb_gen.generate_batch_parallel(slide_dicts, frame_iter)
+            # Generate thumbnails using direct frame seeking (much faster than sequential reading)
+            # Use video_io's video_path_str for proper URL handling
+            self.slides_with_thumbnails = thumb_gen.generate_batch_parallel(
+                slide_dicts, video_io.video_path_str, frame_positions
+            )
 
             # Check if stopped after thumbnail generation
             if self.check_stop():
@@ -262,19 +270,21 @@ class VideoProcessingPipeline:
                 max_workers=4  # Use 4 processes for parallel OCR
             )
 
-            # Load images
+            # Load images (use only original high-res images)
             images = []
             for slide in slides:
-                thumb_path = slide.get('thumbnail_path')
-                if thumb_path and Path(thumb_path).exists():
+                # 只使用original_image_path（原图），不使用缩略图
+                img_path = slide.get('original_image_path')
+                if img_path and Path(img_path).exists():
                     import cv2
-                    img = cv2.imread(thumb_path)
+                    img = cv2.imread(img_path)
                     if img is not None:
                         images.append(img)
                     else:
-                        self.logger.warning(f"Could not load image: {thumb_path}")
+                        self.logger.warning(f"Could not load image: {img_path}")
                         images.append(None)
                 else:
+                    self.logger.warning(f"Original image not found: {img_path}")
                     images.append(None)
 
             # Recognize page numbers (use parallel processing by default)
@@ -440,8 +450,9 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                     file_types=['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
                 )
                 video_path_input = gr.Textbox(
-                    label="或输入视频路径",
-                    placeholder="/path/to/video.mp4"
+                    label="或输入本地文件路径/URL",
+                    placeholder="/path/to/video.mp4 或 http://example.com/video.mp4",
+                    info="支持本地文件路径或HTTP/HTTPS URL"
                 )
 
             with gr.Row():
@@ -499,6 +510,25 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                 with gr.Row():
                     use_ssim = gr.Checkbox(label="使用SSIM算法", value=False)
                     use_histogram = gr.Checkbox(label="使用直方图算法", value=False)
+
+            # Time range section (not part of preset)
+            with gr.Accordion("检测范围 (可选)", open=False):
+                gr.Markdown("设置检测的时间范围，支持格式: 时:分:秒 (如: 1:30:45, 30:45, 45)")
+
+                with gr.Row():
+                    start_time_input = gr.Textbox(
+                        label="起始时间",
+                        placeholder="例: 1:30:45 或 30:45",
+                        info="留空表示从视频开始检测"
+                    )
+                    end_time_input = gr.Textbox(
+                        label="终止时间",
+                        placeholder="例: 10:00:00 或 5:00",
+                        info="留空表示检测到视频结束"
+                    )
+
+                with gr.Row():
+                    clear_time_btn = gr.Button("清除时间范围", variant="secondary")
 
             with gr.Row():
                 parse_btn = gr.Button("开始解析", variant="primary", scale=1)
@@ -560,7 +590,7 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                 outputs=[parse_status, detection_preset_dropdown]
             )
 
-            def parse_video_gui(vfile, vpath, outdir, threshold, stable, duration, interval, ssim, histogram):
+            def parse_video_gui(vfile, vpath, outdir, threshold, stable, duration, interval, ssim, histogram, start_time_str, end_time_str):
                 """Parse video with proper timestamp directory generation"""
                 import os
                 from pathlib import Path as PathLib
@@ -572,8 +602,22 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                     return "Error: No video file provided", None, []
 
                 # Generate timestamp directory based on CLI logic
-                video_path_obj = PathLib(video_path)
-                video_name = video_path_obj.stem  # filename without extension
+                # Extract video name (handle both local files and URLs)
+                is_url = video_path.startswith(('http://', 'https://'))
+                if is_url:
+                    # For URLs, extract filename from URL
+                    url_filename = video_path.split('/')[-1].split('?')[0].split('#')[0]
+                    video_name = url_filename
+                    for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v']:
+                        if video_name.lower().endswith(ext.lower()):
+                            video_name = video_name[:-len(ext)]
+                            break
+                    video_name = video_name or 'video'
+                else:
+                    # For local files, use existing logic
+                    video_path_obj = PathLib(video_path)
+                    video_name = video_path_obj.stem  # filename without extension
+
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
                 # Calculate final output directory
@@ -622,6 +666,19 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                 if pipeline.check_stop():
                     return "Processing cancelled by user", None, []
 
+                # Parse time range
+                from .video_io import parse_time_string
+                start_time = parse_time_string(start_time_str) if start_time_str else 0.0
+                end_time = parse_time_string(end_time_str) if end_time_str else None
+
+                # Validate time range
+                if start_time is not None and start_time < 0:
+                    return "Error: Start time cannot be negative", None, []
+                if end_time is not None and end_time < 0:
+                    return "Error: End time cannot be negative", None, []
+                if start_time is not None and end_time is not None and start_time >= end_time:
+                    return "Error: Start time must be less than end time", None, []
+
                 # Detect slides
                 detector = SlideDetector(
                     frame_diff_threshold=threshold,
@@ -631,8 +688,12 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                     use_histogram=histogram
                 )
 
-                # Get frame iterator
-                frame_iter = video_io.get_frame_iter(target_fps=1.0/interval)
+                # Get frame iterator with time range
+                frame_iter = video_io.get_frame_iter(
+                    start_time=start_time if start_time is not None else 0.0,
+                    end_time=end_time,
+                    target_fps=1.0/interval
+                )
 
                 # Process frames
                 pipeline.slide_frames = detector.process_frames(frame_iter, pipeline.video_metadata.fps)
@@ -655,11 +716,14 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                 # Convert to dictionaries for thumbnail generation
                 slide_dicts = [asdict(sf) for sf in pipeline.slide_frames]
 
-                # Get frame iterator again for thumbnail generation
-                frame_iter = video_io.get_frame_iter(target_fps=1.0/interval)
+                # Extract frame positions for thumbnails (optimized with direct seeking)
+                frame_positions = [sf.frame_number for sf in pipeline.slide_frames]
 
-                # Generate thumbnails (use parallel method for I/O speedup)
-                pipeline.slides_with_thumbnails = thumb_gen.generate_batch_parallel(slide_dicts, frame_iter)
+                # Generate thumbnails using direct frame seeking (much faster than sequential reading)
+                # Use video_io's video_path_str for proper URL handling
+                pipeline.slides_with_thumbnails = thumb_gen.generate_batch_parallel(
+                    slide_dicts, video_io.video_path_str, frame_positions
+                )
 
                 # Check if stopped after thumbnail generation
                 if pipeline.check_stop():
@@ -687,8 +751,20 @@ def create_gradio_interface(pipeline: VideoProcessingPipeline):
                 fn=parse_video_gui,
                 inputs=[video_input, video_path_input, output_dir,
                        frame_diff_threshold, min_stable_frames, min_duration_sec,
-                       frame_interval, use_ssim, use_histogram],
+                       frame_interval, use_ssim, use_histogram,
+                       start_time_input, end_time_input],
                 outputs=[parse_status, video_info, current_slides]
+            )
+
+            # Clear time range button
+            def clear_time_range():
+                """Clear time range inputs"""
+                return "", ""
+
+            clear_time_btn.click(
+                fn=clear_time_range,
+                inputs=[],
+                outputs=[start_time_input, end_time_input]
             )
 
             # Stop processing button
@@ -1147,11 +1223,11 @@ ROI区域 (像素):
                     max_workers=4  # Use 4 processes for parallel OCR
                 )
 
-                # Load images -优先使用原图以提高OCR准确度
+                # Load images (use only original high-res images)
                 images = []
                 for slide in slides:
-                    # 优先使用original_image_path（原图），没有才用thumbnail_path（缩略图）
-                    img_path = slide.get('original_image_path') or slide.get('thumbnail_path')
+                    # 只使用original_image_path（原图），不使用缩略图
+                    img_path = slide.get('original_image_path')
 
                     if img_path and PathLib(img_path).exists():
                         img = cv2.imread(img_path)
@@ -1161,7 +1237,7 @@ ROI区域 (像素):
                             pipeline.logger.warning(f"Failed to load image: {img_path}")
                             images.append(None)
                     else:
-                        pipeline.logger.warning(f"Image path not found: {img_path}")
+                        pipeline.logger.warning(f"Original image not found: {img_path}")
                         images.append(None)
 
                 # Recognize page numbers (use parallel processing by default)
@@ -1196,7 +1272,7 @@ ROI区域 (像素):
 
                         # Save if pages_dir exists
                         if pages_dir:
-                            source_path = slide.get('original_image_path') or slide.get('thumbnail_path')
+                            source_path = slide.get('original_image_path')
                             if source_path and PathLib(source_path).exists():
                                 from PIL import Image as PILImage
                                 try:
@@ -1204,6 +1280,8 @@ ROI区域 (像素):
                                         img.save(pages_dir / f"{filename}.jpg", "JPEG", quality=95)
                                 except Exception as e:
                                     pipeline.logger.warning(f"Failed to save page {filename}: {e}")
+                            else:
+                                pipeline.logger.warning(f"Original image not found for page {filename}")
 
                         ocr_results_dict[i] = page_number
 

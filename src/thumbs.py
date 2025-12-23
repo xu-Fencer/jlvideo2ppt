@@ -104,7 +104,7 @@ class ThumbnailGenerator:
             timestamp: Frame timestamp
 
         Returns:
-            Dictionary with 'thumbnail_path' and optionally 'original_path'
+            Dictionary with 'thumbnail_path' and optionally 'original_image_path'
         """
         # Generate filename based on slide index and timestamp
         filename = f"slide_{slide_idx:04d}_{timestamp:.2f}s.jpg"
@@ -118,7 +118,7 @@ class ThumbnailGenerator:
             result['thumbnail_path'] = str(thumb_path)
             if self.original_dir:
                 original_path = self.original_dir / filename
-                result['original_path'] = str(original_path) if original_path.exists() else None
+                result['original_image_path'] = str(original_path) if original_path.exists() else None
             return result
 
         try:
@@ -130,7 +130,7 @@ class ThumbnailGenerator:
                     frame,
                     [cv2.IMWRITE_JPEG_QUALITY, 95, cv2.IMWRITE_JPEG_OPTIMIZE, 1]
                 )
-                result['original_path'] = str(original_path)
+                result['original_image_path'] = str(original_path)
                 self.logger.debug(f"Saved original image: {filename}")
 
             # Optimized thumbnail generation using OpenCV with two-stage scaling
@@ -208,7 +208,7 @@ class ThumbnailGenerator:
                     try:
                         result = self.generate_thumbnail(frame, idx, target_time)
                         slide['thumbnail_path'] = result['thumbnail_path']
-                        slide['original_image_path'] = result.get('original_path')
+                        slide['original_image_path'] = result.get('original_image_path')
                     except Exception as e:
                         self.logger.error(f"Error generating thumbnail for slide {idx}: {e}")
                         slide['thumbnail_path'] = None
@@ -227,7 +227,7 @@ class ThumbnailGenerator:
                     try:
                         result = self.generate_thumbnail(use_frame, idx, target_time)
                         slide['thumbnail_path'] = result['thumbnail_path']
-                        slide['original_image_path'] = result.get('original_path')
+                        slide['original_image_path'] = result.get('original_image_path')
                     except Exception as e:
                         self.logger.error(f"Error generating thumbnail for slide {idx}: {e}")
                         slide['thumbnail_path'] = None
@@ -261,85 +261,102 @@ class ThumbnailGenerator:
 
         return updated_slides
 
+    def extract_frames_at_positions(self,
+                                    video_path: Union[str, Path],
+                                    frame_positions: List[int]) -> List[Tuple[int, np.ndarray]]:
+        """
+        Extract frames at specific positions using direct frame seeking (optimized)
+
+        Args:
+            video_path: Path to video file
+            frame_positions: List of frame numbers to extract
+
+        Returns:
+            List of (frame_number, frame) tuples for requested positions
+        """
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {video_path}")
+
+        try:
+            frames = []
+            for frame_number in tqdm(frame_positions, desc="Extracting frames", unit="frame"):
+                # Seek directly to the target frame (much faster than sequential reading)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+                ret, frame = cap.read()
+
+                if ret and frame is not None:
+                    frames.append((frame_number, frame))
+                else:
+                    self.logger.warning(f"Failed to read frame at position {frame_number}")
+
+            return frames
+        finally:
+            cap.release()
+
     def generate_batch_parallel(self,
                                 slide_frames: List[Dict],
-                                frame_iterator) -> List[Dict]:
+                                video_path: Union[str, Path],
+                                frame_positions: Optional[List[int]] = None) -> List[Dict]:
         """
-        Generate thumbnails for multiple slides using parallel I/O
+        Generate thumbnails for multiple slides using parallel I/O (optimized with direct seeking)
 
         Args:
             slide_frames: List of slide frame metadata
-            frame_iterator: Video frame iterator
+            video_path: Path to video file
+            frame_positions: Optional list of frame numbers to extract (if None, use frame_number from slide_frames)
 
         Returns:
             Updated slide frames with thumbnail paths
         """
         self.logger.info(f"Generating {len(slide_frames)} thumbnails with parallel I/O...")
 
-        # Sort slide frames by timestamp for single-pass processing
+        # Sort slide frames by frame number for optimal seeking order
         indexed_slides = [(idx, slide) for idx, slide in enumerate(slide_frames)]
-        indexed_slides.sort(key=lambda x: x[1]['timestamp'])
+        indexed_slides.sort(key=lambda x: x[1]['frame_number'])
 
-        # Create a map of target timestamps to slide indices
-        pending_slides = {slide['timestamp']: (idx, slide) for idx, slide in indexed_slides}
-        target_times = sorted(pending_slides.keys())
+        # Get frame positions to extract
+        if frame_positions is None:
+            # Extract frame numbers from slide metadata
+            frame_positions = [slide['frame_number'] for _, slide in indexed_slides]
+        else:
+            # Ensure we have positions for all slides
+            if len(frame_positions) < len(slide_frames):
+                raise ValueError(f"frame_positions has {len(frame_positions)} items but need {len(slide_frames)}")
 
-        updated_slides = [None] * len(slide_frames)
-        current_target_idx = 0
-        last_frame = None
-        last_timestamp = -1
+        # Extract frames at specific positions (optimized with direct seeking)
+        extracted_frames = self.extract_frames_at_positions(video_path, frame_positions)
 
-        # Collect frames to process
+        # Create a map of frame number to frame data
+        frame_map = {fn: frame for fn, frame in extracted_frames}
+
+        # Process frames in parallel
         frames_to_process = []
+        for (idx, slide), frame_number in zip(indexed_slides, frame_positions):
+            if frame_number in frame_map:
+                frame = frame_map[frame_number]
+                frames_to_process.append((idx, frame, slide['timestamp']))
+            else:
+                self.logger.warning(f"Frame {frame_number} not found for slide {idx}")
+                updated_slides = slide_frames.copy()
+                return updated_slides
 
-        # Process frames one at a time (memory efficient)
-        for frame_number, frame, timestamp in tqdm(frame_iterator, desc="Collecting frames"):
-            # Check if we've passed all target times
-            if current_target_idx >= len(target_times):
-                # Release the last frame
-                if last_frame is not None:
-                    del last_frame
-                    last_frame = None
-                break
+        # Process thumbnails in parallel (I/O bound, so ThreadPoolExecutor is appropriate)
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all thumbnail generation tasks
+            future_to_idx = {
+                executor.submit(self.generate_thumbnail, frame, idx, timestamp): idx
+                for idx, frame, timestamp in frames_to_process
+            }
 
-            # Find slides that match this frame's timestamp
-            while current_target_idx < len(target_times):
-                target_time = target_times[current_target_idx]
+            # Collect results as they complete
+            updated_slides = [None] * len(slide_frames)
+            for future in tqdm(future_to_idx, desc="Processing thumbnails", unit="slide"):
+                idx = future_to_idx[future]
+                updated_slide = future.result()
+                updated_slides[idx] = updated_slide
 
-                # If this frame is close enough to the target
-                if abs(timestamp - target_time) < 0.5:  # 0.5 second tolerance
-                    idx, slide = pending_slides[target_time]
-                    frames_to_process.append((idx, frame.copy(), target_time))
-                    updated_slides[idx] = slide
-                    current_target_idx += 1
-
-                # If we've passed the target time, use the last frame or current frame
-                elif timestamp > target_time:
-                    idx, slide = pending_slides[target_time]
-                    # Use the closer frame (last or current)
-                    use_frame = frame
-                    if last_frame is not None and abs(last_timestamp - target_time) < abs(timestamp - target_time):
-                        use_frame = last_frame
-
-                    frames_to_process.append((idx, use_frame.copy(), target_time))
-                    updated_slides[idx] = slide
-                    current_target_idx += 1
-                else:
-                    # Haven't reached the target time yet
-                    break
-
-            # Keep only the last frame for potential use
-            if last_frame is not None:
-                del last_frame
-            last_frame = frame.copy()  # Make a copy since frame may be reused
-            last_timestamp = timestamp
-
-            # Release current frame reference
-            del frame
-
-        # Clean up
-        if last_frame is not None:
-            del last_frame
+        return updated_slides
 
         # Handle any remaining slides (use last available frame info)
         for idx, slide in indexed_slides:
@@ -360,7 +377,7 @@ class ThumbnailGenerator:
                     return idx, result
                 except Exception as e:
                     self.logger.error(f"Error generating thumbnail for slide {idx}: {e}")
-                    return idx, {'thumbnail_path': None, 'original_path': None}
+                    return idx, {'thumbnail_path': None, 'original_image_path': None}
 
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 # Submit all tasks
@@ -370,7 +387,7 @@ class ThumbnailGenerator:
                 for future in tqdm(futures, desc="Writing thumbnails (parallel)"):
                     idx, result = future.result()
                     updated_slides[idx]['thumbnail_path'] = result['thumbnail_path']
-                    updated_slides[idx]['original_image_path'] = result.get('original_path')
+                    updated_slides[idx]['original_image_path'] = result.get('original_image_path')
 
         return updated_slides
 
