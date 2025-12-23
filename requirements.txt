@@ -16,5 +16,4 @@ reportlab>=4.0.0
 
 # Utilities
 jsonschema>=4.19.0
-pathlib>=1.0.1
 tqdm>=4.66.0
