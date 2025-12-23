@@ -1,0 +1,128 @@
+name: Build and Release
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pillow reportlab
+          pip install -r requirements.txt
+
+      - name: Build directory distribution (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --onedir --console --name="JLVideo2PPT" --clean jlvideo2ppt.spec
+        shell: cmd
+
+      - name: Build directory distribution (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --onedir --console --name="JLVideo2PPT" --clean jlvideo2ppt.spec
+        shell: bash
+
+      - name: Build directory distribution (macOS)
+        if: runner.os == 'Darwin'
+        run: |
+          pyinstaller --onedir --console --name="JLVideo2PPT" --clean jlvideo2ppt.spec
+        shell: bash
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: JLVideo2PPT-Windows
+          path: dist/JLVideo2PPT
+
+      - name: Upload artifact (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: JLVideo2PPT-Linux
+          path: dist/JLVideo2PPT
+
+      - name: Upload artifact (macOS)
+        if: runner.os == 'Darwin'
+        uses: actions/upload-artifact@v4
+        with:
+          name: JLVideo2PPT-macOS
+          path: dist/JLVideo2PPT
+
+  create-release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*
+          body: |
+            ## 下载说明
+
+            ### Windows
+            下载 `JLVideo2PPT-Windows.zip`，解压后运行 `JLVideo2PPT.exe`
+
+            ### Linux
+            下载 `JLVideo2PPT-Linux.tar.gz`，解压后运行：
+            ```bash
+            chmod +x JLVideo2PPT
+            ./JLVideo2PPT
+            ```
+
+            ### macOS
+            下载 `JLVideo2PPT-macOS.tar.gz`，解压后运行：
+            ```bash
+            chmod +x JLVideo2PPT
+            ./JLVideo2PPT
+            ```
+
+            ## 系统要求
+
+            - Windows 10/11, Linux, macOS 10.15+
+            - Python 3.8+ (如果从源码运行)
+
+            ## 使用方法
+
+            1. 下载并解压对应平台的压缩包
+            2. 运行程序：
+               - Windows: 双击 `JLVideo2PPT.exe`
+               - Linux/macOS: 在终端运行 `./JLVideo2PPT`
+            3. 访问 http://127.0.0.1:7930
+
+            ## 注意事项
+
+            - **目录形式打包**：启动更快，无需解压
+            - 杀毒软件可能误报，添加白名单即可
+            - 如需修改端口：命令行参数 `--server-port 8080`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

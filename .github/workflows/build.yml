@@ -1,0 +1,59 @@
+name: Build Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-build:
+    name: Test build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pillow reportlab
+          pip install -r requirements.txt
+
+      - name: Build directory distribution (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --onedir --console --name="JLVideo2PPT-Test" --clean jlvideo2ppt.spec
+        shell: cmd
+
+      - name: Build directory distribution (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --onedir --console --name="JLVideo2PPT-Test" --clean jlvideo2ppt.spec
+        shell: bash
+
+      - name: Build directory distribution (macOS)
+        if: runner.os == 'Darwin'
+        run: |
+          pyinstaller --onedir --console --name="JLVideo2PPT-Test" --clean jlvideo2ppt.spec
+        shell: bash
+
+      - name: Verify directory exists
+        run: |
+          if [ -d "dist/JLVideo2PPT-Test" ]; then
+            echo "Build successful!"
+            ls -lh dist/JLVideo2PPT-Test/
+          else
+            echo "Build failed: directory not found"
+            exit 1
+          fi
