@@ -1,0 +1,44 @@
+{
+  "name": "test_very_sensitive",
+  "version": "1.0.0",
+  "description": "Test preset with very low detection threshold",
+  "detection": {
+    "frame_diff_threshold": 3.0,
+    "min_stable_frames": 1,
+    "min_duration_sec": 0.3,
+    "target_fps": 0.5,
+    "use_ssim": false,
+    "use_histogram": false,
+    "ssim_threshold": 0.8,
+    "histogram_threshold": 0.9
+  },
+  "thumbnail": {
+    "max_size": 800,
+    "quality": 85,
+    "dpi": 150
+  },
+  "selection": {
+    "default_selection": "all",
+    "multi_select": true,
+    "sort_by_page": false,
+    "show_statistics": true
+  },
+  "ocr": {
+    "engine": "pytesseract",
+    "roi_x": 70.0,
+    "roi_y": 70.0,
+    "roi_w": 25.0,
+    "roi_h": 20.0,
+    "confidence_threshold": 30.0,
+    "language": "eng"
+  },
+  "export": {
+    "format": "pdf",
+    "image_format": "png",
+    "image_quality": 95,
+    "pdf_page_size": "A4",
+    "pdf_margin": 0.5,
+    "naming": "index",
+    "output_dir": "OUTPUT"
+  }
+}

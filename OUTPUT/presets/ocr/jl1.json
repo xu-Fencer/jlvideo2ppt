@@ -1,0 +1,8 @@
+{
+  "engine": "easyocr",
+  "roi_x": 92,
+  "roi_y": 94.5,
+  "roi_w": 6,
+  "roi_h": 5,
+  "name": "jl1"
+}

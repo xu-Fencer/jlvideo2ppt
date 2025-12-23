@@ -1,0 +1,9 @@
+{
+  "frame_diff_threshold": 5,
+  "min_stable_frames": 1,
+  "min_duration_sec": 0.5,
+  "frame_interval": 5,
+  "use_ssim": false,
+  "use_histogram": false,
+  "name": "敏感测试1"
+}

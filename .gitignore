@@ -143,7 +143,7 @@ cython_debug/
 .vscode/
 
 # Project specific
-OUTPUT/
+OUTPUT/*
 *.mp4
 *.avi
 *.mov
@@ -151,3 +151,5 @@ OUTPUT/
 *.wmv
 *.flv
 *.webm
+nul
+!OUTPUT/presets/
